@@ -1,0 +1,22 @@
+# Managed by Ansible. Local changes will be overwritten.
+
+server {
+    listen 80 default_server;
+    listen [::]:80 default_server;
+    server_name _;
+
+    default_type text/html;
+    return 200 '<!doctype html><html lang="en"><head><meta charset="utf-8"><title>$hostname</title></head><body><h1>$hostname</h1></body></html>';
+}
+
+server {
+    listen 443 ssl http2 default_server;
+    listen [::]:443 ssl http2 default_server;
+    server_name _;
+
+    ssl_certificate     /etc/pki/tls/certs/nginx-default.crt;
+    ssl_certificate_key /etc/pki/tls/private/nginx-default.key;
+
+    default_type text/html;
+    return 200 '<!doctype html><html lang="en"><head><meta charset="utf-8"><title>$hostname</title></head><body><h1>$hostname</h1></body></html>';
+}

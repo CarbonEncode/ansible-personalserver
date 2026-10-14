@@ -31,6 +31,8 @@ The roles in `main.yml` run in the following order:
      Encrypt.
    - Issues certificates containing the zone apex and wildcard name.
    - Verifies certificate files before enabling SSL virtual hosts.
+   - Creates a self-signed default HTTPS virtual host that returns the server
+     hostname directly from Nginx without a document root.
    - Creates `sites-enabled` symlinks and validates Nginx before every reload.
 4. **MariaDB**
    - Installs MariaDB and restricts it to localhost.
@@ -137,6 +139,8 @@ ansible-playbook main.yml --ask-vault-pass
 | Web roots | `/var/www/<domain>/public_html` |
 | Nginx available vhosts | `/etc/nginx/sites-available` |
 | Nginx enabled vhosts | `/etc/nginx/sites-enabled` |
+| Default self-signed certificate | `/etc/pki/tls/certs/nginx-default.crt` |
+| Default self-signed private key | `/etc/pki/tls/private/nginx-default.key` |
 | Installed certificates | `/etc/pki/tls/acme/<zone>` |
 | acme.sh runtime | `/opt/acme.sh` |
 | Temporary acme.sh source (removed after installation) | `/usr/local/src/acme.sh` |
@@ -152,6 +156,8 @@ ansible-playbook main.yml --ask-vault-pass
 - Initial Diffie-Hellman parameter generation may take several minutes.
 - SSL virtual hosts are not deployed unless their full chain and private key
   exist and are non-empty.
+- Per-application files under `/etc/nginx/sites-available/<domain>.conf` are
+  created only when absent; later local changes are preserved by Ansible.
 - The firewall script flushes existing IPv4 and IPv6 filter rules before
   applying the managed rules. Add required ports to the script before running
   the playbook.

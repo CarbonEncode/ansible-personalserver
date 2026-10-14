@@ -101,6 +101,74 @@
     group: root
     mode: "0644"
 
+- name: Ensure standard TLS directories are present
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: root
+    group: root
+  loop:
+    - /etc/pki/tls/certs
+    - /etc/pki/tls/private
+
+- name: Check the default virtual host certificate
+  ansible.builtin.stat:
+    path: /etc/pki/tls/certs/nginx-default.crt
+  register: nginx_default_certificate
+
+- name: Check the default virtual host private key
+  ansible.builtin.stat:
+    path: /etc/pki/tls/private/nginx-default.key
+  register: nginx_default_private_key
+
+- name: Generate the default virtual host self-signed certificate
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/openssl
+      - req
+      - -x509
+      - -nodes
+      - -newkey
+      - rsa:2048
+      - -sha256
+      - -days
+      - "3650"
+      - -subj
+      - "/CN={{ system_hostname }}"
+      - -addext
+      - "subjectAltName=DNS:{{ system_hostname }}"
+      - -keyout
+      - /etc/pki/tls/private/nginx-default.key
+      - -out
+      - /etc/pki/tls/certs/nginx-default.crt
+  when: >-
+    not nginx_default_certificate.stat.exists
+    or not nginx_default_private_key.stat.exists
+  notify: Reload nginx
+
+- name: Set default virtual host certificate permissions
+  ansible.builtin.file:
+    path: /etc/pki/tls/certs/nginx-default.crt
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: Set default virtual host private key permissions
+  ansible.builtin.file:
+    path: /etc/pki/tls/private/nginx-default.key
+    owner: root
+    group: root
+    mode: "0600"
+
+- name: Apply SELinux contexts to the default virtual host certificate
+  ansible.builtin.command:
+    argv:
+      - restorecon
+      - -F
+      - /etc/pki/tls/certs/nginx-default.crt
+      - /etc/pki/tls/private/nginx-default.key
+  changed_when: false
+
 - name: Install the primary Nginx configuration
   template:
     src: nginx.conf.j2
@@ -108,6 +176,22 @@
     owner: root
     group: root
     mode: "0644"
+  notify: Reload nginx
+
+- name: Install the default Nginx virtual host
+  ansible.builtin.template:
+    src: default-vhost.conf.j2
+    dest: /etc/nginx/sites-available/default.conf
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Reload nginx
+
+- name: Enable the default Nginx virtual host
+  ansible.builtin.file:
+    src: /etc/nginx/sites-available/default.conf
+    dest: /etc/nginx/sites-enabled/00-default.conf
+    state: link
   notify: Reload nginx
 
 - name: Validate the base Nginx configuration
