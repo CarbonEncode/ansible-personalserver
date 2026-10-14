@@ -3,6 +3,7 @@ set -euo pipefail
 
 IPT="/usr/sbin/iptables-nft"
 IP6T="/usr/sbin/ip6tables-nft"
+IPSET="/usr/sbin/ipset"
 
 # IPv4 Rules
 
@@ -15,6 +16,20 @@ ${IPT} -A INPUT -i lo -j ACCEPT
 ${IPT} -A OUTPUT -o lo -j ACCEPT
 ${IPT} -A INPUT -p icmp -j ACCEPT
 ${IPT} -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+
+# Drop IPv4 addresses published by the managed threat-feed updater.
+if [ -f /opt/threatfeed/bin/threatfeed-updater.php ]; then
+    for set_name in ipsum_level3 firehol_abusers_1d firehol_abuseipdb_30d firehol_level2 firehol_level1; do
+        if ! ${IPSET} list "${set_name}" >/dev/null 2>&1; then
+            ${IPSET} create "${set_name}" hash:net family inet hashsize 1024 maxelem 65536
+        fi
+
+        ${IPT} -I INPUT -m set --match-set "${set_name}" src -j DROP
+        ${IPT} -I FORWARD -m set --match-set "${set_name}" src -j DROP
+        ${IPT} -I OUTPUT -m set --match-set "${set_name}" dst -j DROP
+    done
+fi
+
 {% for source in firewall_ssh_whitelist.ipv4 %}
 ${IPT} -A INPUT -p tcp -s {{ source | quote }} --dport 22 -j ACCEPT
 {% endfor %}

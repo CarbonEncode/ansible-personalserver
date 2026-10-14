@@ -4,6 +4,17 @@
     name: "*"
     state: latest
 
+- name: Ensure cron is installed
+  ansible.builtin.dnf:
+    name: cronie
+    state: present
+
+- name: Ensure cron is enabled and started
+  ansible.builtin.systemd:
+    name: crond.service
+    enabled: true
+    state: started
+
 - name: Update hostname to "{{ system_hostname }}"
   hostname:
     name: "{{ system_hostname }}"

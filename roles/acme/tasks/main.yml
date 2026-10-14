@@ -41,17 +41,32 @@
     state: restarted
   when: acme_nginx_group_membership.changed
 
+- name: Check whether acme.sh is already installed
+  ansible.builtin.stat:
+    path: /opt/acme.sh/acme.sh
+  register: acme_sh_installed
+
+- name: Ensure the temporary source directory is present
+  ansible.builtin.file:
+    path: /usr/local/src
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
 - name: Check out the pinned acme.sh release
   git:
     repo: https://github.com/acmesh-official/acme.sh.git
-    dest: /opt/acme.sh-source
+    dest: /usr/local/src/acme.sh
     version: "{{ acme_sh_version }}"
     update: false
+  when: not acme_sh_installed.stat.exists
 
 - name: Install acme.sh and its renewal cron job
   command:
+    chdir: /usr/local/src/acme.sh
     argv:
-      - /opt/acme.sh-source/acme.sh
+      - /usr/local/src/acme.sh/acme.sh
       - --install
       - --home
       - /opt/acme.sh
@@ -60,8 +75,9 @@
       - --accountemail
       - "{{ acme_email }}"
     creates: /opt/acme.sh/acme.sh
+  when: not acme_sh_installed.stat.exists
 
-- name: Remove the legacy acme.sh source checkout
+- name: Remove the temporary acme.sh source checkout
   file:
     path: /usr/local/src/acme.sh
     state: absent

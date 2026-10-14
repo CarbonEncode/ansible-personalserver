@@ -1,0 +1,27 @@
+[Unit]
+Description=Update managed IPv4 threat-feed ipsets
+After=network-online.target systemd-resolved.service iptables-rules.service
+Wants=network-online.target systemd-resolved.service
+Requires=iptables-rules.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/php /opt/threatfeed/bin/threatfeed-updater.php --daemon
+Restart=on-failure
+RestartSec=30s
+User=root
+Group=root
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+CapabilityBoundingSet=CAP_NET_ADMIN
+AmbientCapabilities=CAP_NET_ADMIN
+LockPersonality=true
+
+[Install]
+WantedBy=multi-user.target

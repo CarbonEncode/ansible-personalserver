@@ -60,9 +60,11 @@
     label: "{{ item }}"
   changed_when: false
 
-- name: Ensure systemd-networkd is installed
+- name: Ensure systemd network services are installed
   ansible.builtin.dnf:
-    name: systemd-networkd
+    name:
+      - systemd-networkd
+      - systemd-resolved
     state: present
 
 - name: Install the systemd-networkd static network configuration
@@ -96,13 +98,18 @@
     - NetworkManager.service
   when: item in ansible_facts.services
 
-- name: Ensure the iptables nftables compatibility tools are present
-  yum:
-    name: iptables-nft
+- name: Ensure firewall and threat-feed dependencies are present
+  ansible.builtin.dnf:
+    name:
+      - ipset
+      - iptables-nft
+      - php-cli
+      - php-curl
+      - php-process
     state: present
 
-- name: Ensure managed firewall directories are present
-  file:
+- name: Ensure managed network tool directories are present
+  ansible.builtin.file:
     path: "{{ item }}"
     state: directory
     owner: root
@@ -110,17 +117,26 @@
     mode: "0750"
   loop:
     - /opt/firewall/bin
-    - /opt/firewall/etc
+    - /opt/threatfeed/bin
 
-- name: Ensure the dynamic DNS hosts file is present
-  file:
-    path: /opt/firewall/etc/ddns_hosts
-    state: touch
-    access_time: preserve
-    modification_time: preserve
+- name: Install the managed threat-feed updater
+  ansible.builtin.template:
+    src: threatfeed-updater.php.j2
+    dest: /opt/threatfeed/bin/threatfeed-updater.php
     owner: root
     group: root
-    mode: "0640"
+    mode: "0750"
+    validate: /usr/bin/php -l %s
+  notify: Restart threat-feed updater
+
+- name: Install the threat-feed updater systemd unit
+  ansible.builtin.copy:
+    src: threatfeed-updater.service
+    dest: /etc/systemd/system/threatfeed-updater.service
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Restart threat-feed updater
 
 - name: Install the managed firewall script
   template:
@@ -144,23 +160,16 @@
 - name: Refresh service state before replacing the firewall
   service_facts:
 
-- name: Stop and disable conflicting firewall services
+- name: Stop and disable firewalld
   systemd:
-    name: "{{ item }}"
+    name: firewalld.service
     enabled: false
     state: stopped
-  loop:
-    - firewalld.service
-    - iptables.service
-    - ip6tables.service
-  when: item in ansible_facts.services
+  when: "'firewalld.service' in ansible_facts.services"
 
-- name: Ensure conflicting firewall implementations are not present
+- name: Ensure firewalld is not present
   yum:
-    name:
-      - firewalld
-      - iptables-services
-      - iptables-nft-services
+    name: firewalld
     state: absent
 
 - name: Ensure the managed firewall service is enabled and started
@@ -170,21 +179,23 @@
     enabled: true
     state: started
 
+- name: Configure Google Public DNS in systemd-resolved
+  ansible.builtin.copy:
+    dest: /etc/systemd/resolved.conf
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      [Resolve]
+      DNS=8.8.8.8 8.8.4.4
+      DNSOverTLS=no
+  notify: Reload systemd-resolved
+
 - name: Ensure systemd-resolved is enabled
-  systemd:
-    name: systemd-resolved
+  ansible.builtin.systemd:
+    name: systemd-resolved.service
     enabled: true
     state: started
-
-- name: Configure Google Public DNS in systemd-resolved
-  blockinfile:
-    path: /etc/systemd/resolved.conf
-    marker: "# {mark} ANSIBLE MANAGED BLOCK"
-    block: |
-      [Resolve]
-      DNS=8.8.8.8#dns.google 8.8.4.4#dns.google 2001:4860:4860::8888#dns.google 2001:4860:4860::8844#dns.google
-      DNSOverTLS=yes
-  notify: Restart resolved
 
 - name: Link resolv.conf to systemd-resolved
   file:
@@ -194,6 +205,13 @@
     group: root
     state: link
     force: true
+
+- name: Ensure the threat-feed updater is enabled and started
+  ansible.builtin.systemd:
+    name: threatfeed-updater.service
+    daemon_reload: true
+    enabled: true
+    state: started
 
 - name: ensure BBR is enabled on the server
   ini_file:

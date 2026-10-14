@@ -11,10 +11,16 @@
     daemon_reload: true
     state: restarted
 
-- name: Restart resolved
-  systemd:
-    name: systemd-resolved
+- name: Restart threat-feed updater
+  ansible.builtin.systemd:
+    name: threatfeed-updater.service
+    daemon_reload: true
     state: restarted
+
+- name: Reload systemd-resolved
+  ansible.builtin.systemd:
+    name: systemd-resolved.service
+    state: reloaded
 
 - name: Reload sysctl
   command: /usr/sbin/sysctl --system

@@ -10,6 +10,7 @@ The roles in `main.yml` run in the following order:
 
 1. **General system configuration**
    - Updates installed packages.
+   - Installs and enables cron.
    - Sets the hostname and forces the timezone to UTC.
    - Replaces root's authorized keys with the inventory-defined list.
    - Disables SSH password authentication and restricts `webusers` to SFTP.
@@ -20,7 +21,9 @@ The roles in `main.yml` run in the following order:
    - Deploys `/opt/firewall/bin/iptables-rules.sh` and its systemd service.
    - Allows inbound SSH only from inventory-defined IPv4 and IPv6 sources.
    - Allows inbound HTTP and HTTPS on ports 80 and 443.
-   - Configures Google Public DNS over TLS and enables BBR.
+   - Maintains IPv4 threat-feed ipsets and blocks matching inbound, forwarded,
+     and outbound traffic.
+   - Configures Google Public DNS through `systemd-resolved` and enables BBR.
 3. **Nginx and certificates**
    - Creates one system user and document root per virtual host.
    - Applies persistent SELinux read/write contexts to each `public_html` tree.
@@ -136,9 +139,9 @@ ansible-playbook main.yml --ask-vault-pass
 | Nginx enabled vhosts | `/etc/nginx/sites-enabled` |
 | Installed certificates | `/etc/pki/tls/acme/<zone>` |
 | acme.sh runtime | `/opt/acme.sh` |
-| acme.sh source | `/opt/acme.sh-source` |
+| Temporary acme.sh source (removed after installation) | `/usr/local/src/acme.sh` |
 | Firewall script | `/opt/firewall/bin/iptables-rules.sh` |
-| Firewall data | `/opt/firewall/etc` |
+| Threat-feed updater | `/opt/threatfeed/bin/threatfeed-updater.php` |
 | Static network configuration | `/etc/systemd/network/10-static.network` |
 | PHP-FPM pools | `/etc/php-fpm.d` |
 
@@ -154,6 +157,8 @@ ansible-playbook main.yml --ask-vault-pass
   the playbook.
 - Port 22 is not globally open. Its IPv4 and IPv6 source rules are generated
   from `firewall_ssh_whitelist` in the inventory.
+- The threat-feed daemon refreshes five IPv4 ipsets every six hours. Networks
+  in `firewall_ssh_whitelist.ipv4` are excluded from every downloaded feed.
 - The playbook validates Nginx with `nginx -t` before reloads and certificate
   renewal reload commands.
 - `iptables-nft` is a compatibility interface. Native nftables should be

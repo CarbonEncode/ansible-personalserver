@@ -1,0 +1,905 @@
+#!/usr/bin/env php
+<?php
+
+declare(strict_types=1);
+
+/*
+ * threatfeed-ipset.php
+ * Release: 1.3.1
+ * Requires: PHP 8.2+, PHP cURL, Linux ipset
+ *
+ * Downloads hardcoded IPsum and FireHOL IPv4 threat feeds, removes all
+ * hardcoded allowlisted networks, and safely synchronizes the results into
+ * separate hash:net ipsets using restore and atomic swaps.
+ */
+
+// -------------------------------------------------------------------------
+// Local configuration
+// -------------------------------------------------------------------------
+
+// Mandatory exclusions applied to every feed. Keep the original protected
+// network and all RFC1918 private address space here. Add further CIDRs below.
+const ALLOWLIST_CIDRS = [
+    // RFC1918 private address space.
+    '10.0.0.0/8',
+    '172.16.0.0/12',
+    '192.168.0.0/16',
+    '127.0.0.0/8',
+
+    // Trusted provider networks.
+{% for source in firewall_ssh_whitelist.ipv4 %}
+    '{{ source if '/' in source else source ~ '/32' }}',
+{% endfor %}
+];
+
+// Set this to the absolute ipset executable path used by this host.
+const IPSET_BINARY = '/usr/sbin/ipset';
+
+// Capacity settings used for every active and temporary hash:net set.
+// IPSET_HASHSIZE must be a power of two. A high value reduces hash collisions
+// at the cost of additional kernel memory. IPSET_MAXELEM is the hard entry cap.
+const IPSET_HASHSIZE = 1_048_576;
+const IPSET_MAXELEM = 1_048_576;
+
+// Keep true for secure HTTPS downloads. Set false only for an intentional,
+// understood exception. The --insecure option also disables verification for
+// an individual run.
+const VERIFY_HTTPS_CERTIFICATES = true;
+
+// -------------------------------------------------------------------------
+// Application constants (normally no changes are needed below this point)
+// -------------------------------------------------------------------------
+
+const LOCK_FILE = '/run/threatfeed-ipset.lock';
+const USER_AGENT = 'threatfeed-ipset/1.3.1';
+const MAX_DOWNLOAD_BYTES = 67_108_864; // 64 MiB
+const MINIMUM_FEED_ENTRIES = 100;
+const DEFAULT_REFRESH_INTERVAL = 21_600; // 6 hours
+
+/** @return array<int, array{name:string,url:string,ipset:string}> */
+function feedDefinitions(): array
+{
+    return [
+        [
+            'name' => 'ipsum-level3',
+            'url' => 'https://raw.githubusercontent.com/stamparm/ipsum/master/levels/3.txt',
+            'ipset' => 'ipsum_level3',
+        ],
+        [
+            'name' => 'firehol-abusers-1d',
+            'url' => 'https://iplists.firehol.org/files/firehol_abusers_1d.netset',
+            'ipset' => 'firehol_abusers_1d',
+        ],
+        [
+            'name' => 'firehol-level2',
+            'url' => 'https://iplists.firehol.org/files/firehol_level2.netset',
+            'ipset' => 'firehol_level2',
+        ],
+        [
+            'name' => 'firehol-level1',
+            'url' => 'https://iplists.firehol.org/files/firehol_level1.netset',
+            'ipset' => 'firehol_level1',
+        ],
+        [
+            'name' => 'firehol-abuseipdb-30d',
+            'url' => 'https://iplists.firehol.org/files/abuseipdb_30d.ipset',
+            'ipset' => 'firehol_abuseipdb_30d',
+        ],
+    ];
+}
+
+function logMessage(string $message, bool $error = false): void
+{
+    $stream = $error ? STDERR : STDOUT;
+    fwrite($stream, sprintf("[%s] %s\n", date('Y-m-d H:i:s'), $message));
+}
+
+/** @return array{insecure:bool,dryRun:bool,daemon:bool,interval:int,help:bool} */
+function parseOptions(array $argv): array
+{
+    $intervalProvided = false;
+    $options = [
+        'insecure' => false,
+        'dryRun' => false,
+        'daemon' => false,
+        'interval' => DEFAULT_REFRESH_INTERVAL,
+        'help' => false,
+    ];
+    foreach (array_slice($argv, 1) as $argument) {
+        if ($argument === '--insecure') {
+            $options['insecure'] = true;
+        } elseif ($argument === '--dry-run') {
+            $options['dryRun'] = true;
+        } elseif ($argument === '--daemon') {
+            $options['daemon'] = true;
+        } elseif ($argument === '--help' || $argument === '-h') {
+            $options['help'] = true;
+        } elseif (str_starts_with($argument, '--interval=')) {
+            $intervalProvided = true;
+            $value = substr($argument, strlen('--interval='));
+            $interval = filter_var($value, FILTER_VALIDATE_INT, ['options' => ['min_range' => 1]]);
+            if ($interval === false || !preg_match('/^[1-9][0-9]*$/', $value)) {
+                throw new InvalidArgumentException('--interval must be a positive whole number of seconds.');
+            }
+            $options['interval'] = $interval;
+        } else {
+            throw new InvalidArgumentException("Unknown option: {$argument}");
+        }
+    }
+    if (!$options['daemon'] && $intervalProvided) {
+        throw new InvalidArgumentException('--interval may only be used together with --daemon.');
+    }
+    return $options;
+}
+
+/** @return array<int, bool|int> */
+function tlsVerificationOptions(bool $insecure): array
+{
+    return [
+        CURLOPT_SSL_VERIFYPEER => !$insecure,
+        CURLOPT_SSL_VERIFYHOST => $insecure ? 0 : 2,
+    ];
+}
+
+function insecureModeEnabled(bool $commandLineInsecure): bool
+{
+    return $commandLineInsecure || !VERIFY_HTTPS_CERTIFICATES;
+}
+
+/** @return array{body:string,status:int,contentType:string} */
+function downloadFeed(string $url, bool $insecure): array
+{
+    $body = '';
+    $tooLarge = false;
+    $handle = curl_init($url);
+    if ($handle === false) {
+        throw new RuntimeException('Unable to initialize cURL.');
+    }
+
+    $options = [
+        CURLOPT_RETURNTRANSFER => false,
+        CURLOPT_FOLLOWLOCATION => true,
+        CURLOPT_MAXREDIRS => 5,
+        CURLOPT_CONNECTTIMEOUT => 15,
+        CURLOPT_TIMEOUT => 120,
+        CURLOPT_USERAGENT => USER_AGENT,
+        CURLOPT_FAILONERROR => false,
+        CURLOPT_HTTPHEADER => ['Accept: text/plain, application/octet-stream;q=0.9'],
+        CURLOPT_PROTOCOLS => CURLPROTO_HTTPS,
+        CURLOPT_REDIR_PROTOCOLS => CURLPROTO_HTTPS,
+        CURLOPT_WRITEFUNCTION => static function ($curl, string $data) use (&$body, &$tooLarge): int {
+            if (strlen($body) + strlen($data) > MAX_DOWNLOAD_BYTES) {
+                $tooLarge = true;
+                return 0;
+            }
+            $body .= $data;
+            return strlen($data);
+        },
+    ] + tlsVerificationOptions($insecure);
+
+    curl_setopt_array($handle, $options);
+    $ok = curl_exec($handle);
+    $error = curl_error($handle);
+    $status = (int) curl_getinfo($handle, CURLINFO_RESPONSE_CODE);
+    $contentType = strtolower((string) curl_getinfo($handle, CURLINFO_CONTENT_TYPE));
+    curl_close($handle);
+
+    if ($tooLarge) {
+        throw new RuntimeException('Download exceeded the 64 MiB size limit.');
+    }
+    if ($ok === false) {
+        throw new RuntimeException("Download failed: {$error}");
+    }
+    if ($status < 200 || $status >= 300) {
+        throw new RuntimeException("Download returned HTTP {$status}.");
+    }
+    if ($body === '') {
+        throw new RuntimeException('Download was empty.');
+    }
+    if (str_contains($contentType, 'text/html') || preg_match('/^\s*(?:<!doctype\s+html|<html\b)/i', $body)) {
+        throw new RuntimeException('Download appears to be HTML, not an IP feed.');
+    }
+
+    return ['body' => $body, 'status' => $status, 'contentType' => $contentType];
+}
+
+/** @return int|float Unsigned 32-bit value; float is used on 32-bit PHP. */
+function ipv4ToInt(string $ip): int|float
+{
+    $packed = inet_pton($ip);
+    if ($packed === false || strlen($packed) !== 4) {
+        throw new InvalidArgumentException("Invalid IPv4 address: {$ip}");
+    }
+    $octets = unpack('C4', $packed);
+    return ($octets[1] * 16_777_216)
+        + ($octets[2] * 65_536)
+        + ($octets[3] * 256)
+        + $octets[4];
+}
+
+function intToIpv4(int|float $value): string
+{
+    if ($value < 0 || $value > 4_294_967_295) {
+        throw new InvalidArgumentException('IPv4 numeric value is outside the unsigned 32-bit range.');
+    }
+
+    // Avoid long2ip() and 32-bit bitwise operations: PHP builds with 32-bit
+    // integers cannot represent unsigned values above 2147483647 as an int.
+    $first = (int) floor($value / 16_777_216);
+    $value -= $first * 16_777_216;
+    $second = (int) floor($value / 65_536);
+    $value -= $second * 65_536;
+    $third = (int) floor($value / 256);
+    $fourth = (int) ($value - ($third * 256));
+
+    return "{$first}.{$second}.{$third}.{$fourth}";
+}
+
+function networkAddress(int|float $address, int $prefix): int|float
+{
+    if ($prefix < 0 || $prefix > 32) {
+        throw new InvalidArgumentException("Invalid IPv4 prefix: {$prefix}");
+    }
+    $blockSize = 2 ** (32 - $prefix);
+    return floor($address / $blockSize) * $blockSize;
+}
+
+/**
+ * Validate and canonicalize an IPv4 address or CIDR. Plain addresses stay plain;
+ * CIDRs (including /32) stay CIDRs.
+ */
+function normalizeIpv4Entry(string $entry): ?string
+{
+    $entry = trim($entry);
+    if ($entry === '') {
+        return null;
+    }
+
+    if (!str_contains($entry, '/')) {
+        if (filter_var($entry, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4) === false) {
+            return null;
+        }
+        return intToIpv4(ipv4ToInt($entry));
+    }
+
+    if (substr_count($entry, '/') !== 1) {
+        return null;
+    }
+    [$ip, $prefixText] = explode('/', $entry, 2);
+    if (filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4) === false
+        || !preg_match('/^(?:0|[1-9][0-9]?)$/', $prefixText)) {
+        return null;
+    }
+    $prefix = (int) $prefixText;
+    if ($prefix > 32) {
+        return null;
+    }
+    $network = networkAddress(ipv4ToInt($ip), $prefix);
+    return intToIpv4($network) . '/' . $prefix;
+}
+
+/** @return array{network:int|float,prefix:int,start:int|float,end:int|float} */
+function cidrRange(string $entry): array
+{
+    $normalized = normalizeIpv4Entry($entry);
+    if ($normalized === null) {
+        throw new InvalidArgumentException("Invalid IPv4 entry: {$entry}");
+    }
+    if (str_contains($normalized, '/')) {
+        [$ip, $prefixText] = explode('/', $normalized, 2);
+        $prefix = (int) $prefixText;
+    } else {
+        $ip = $normalized;
+        $prefix = 32;
+    }
+    $network = networkAddress(ipv4ToInt($ip), $prefix);
+    $size = 2 ** (32 - $prefix);
+    return ['network' => $network, 'prefix' => $prefix, 'start' => $network, 'end' => $network + $size - 1];
+}
+
+/**
+ * Subtract one IPv4 CIDR from another without expanding addresses.
+ *
+ * @return list<string> canonical CIDRs remaining from $blocked
+ */
+function subtractCidr(string $blocked, string $excluded): array
+{
+    $blockedRange = cidrRange($blocked);
+    $excludedRange = cidrRange($excluded);
+
+    if ($blockedRange['end'] < $excludedRange['start'] || $blockedRange['start'] > $excludedRange['end']) {
+        return [intToIpv4($blockedRange['network']) . '/' . $blockedRange['prefix']];
+    }
+    if ($excludedRange['start'] <= $blockedRange['start'] && $excludedRange['end'] >= $blockedRange['end']) {
+        return [];
+    }
+
+    // Because both inputs are CIDRs, a partial overlap means the blocked CIDR
+    // contains the excluded CIDR. Split only the branch containing it.
+    $result = [];
+    $pending = [[$blockedRange['network'], $blockedRange['prefix']]];
+    while ($pending !== []) {
+        [$network, $prefix] = array_pop($pending);
+        $size = 2 ** (32 - $prefix);
+        $end = $network + $size - 1;
+
+        if ($end < $excludedRange['start'] || $network > $excludedRange['end']) {
+            $result[] = intToIpv4($network) . '/' . $prefix;
+            continue;
+        }
+        if ($excludedRange['start'] <= $network && $excludedRange['end'] >= $end) {
+            continue;
+        }
+        if ($prefix >= 32) {
+            continue;
+        }
+
+        $childPrefix = $prefix + 1;
+        $half = 2 ** (32 - $childPrefix);
+        // Push right then left for stable ascending output.
+        $pending[] = [$network + $half, $childPrefix];
+        $pending[] = [$network, $childPrefix];
+    }
+
+    usort($result, static fn(string $a, string $b): int => cidrRange($a)['start'] <=> cidrRange($b)['start']);
+    return $result;
+}
+
+/**
+ * @return array{entries:list<string>,valid:int,invalid:int,ignored:int,duplicates:int,overlapsRemoved:int,overlapsSplit:int}
+ */
+function parseFeed(string $body, array $allowlistCidrs = ALLOWLIST_CIDRS): array
+{
+    $unique = [];
+    $valid = 0;
+    $invalid = 0;
+    $ignored = 0;
+    $duplicates = 0;
+
+    foreach (preg_split('/\R/', $body) ?: [] as $line) {
+        $line = trim((string) preg_replace('/\s*#.*$/', '', $line));
+        if ($line === '') {
+            $ignored++;
+            continue;
+        }
+        $normalized = normalizeIpv4Entry($line);
+        if ($normalized === null) {
+            $invalid++;
+            continue;
+        }
+        $valid++;
+        if (isset($unique[$normalized])) {
+            $duplicates++;
+            continue;
+        }
+        $unique[$normalized] = true;
+    }
+
+    if ($allowlistCidrs === []) {
+        throw new RuntimeException('The hardcoded allowlist must not be empty.');
+    }
+    foreach ($allowlistCidrs as $allowlistedCidr) {
+        $normalizedAllowlist = normalizeIpv4Entry($allowlistedCidr);
+        if ($normalizedAllowlist === null || !str_contains($allowlistedCidr, '/')) {
+            throw new RuntimeException("Invalid hardcoded allowlist CIDR: {$allowlistedCidr}");
+        }
+    }
+
+    $filtered = [];
+    $overlapsRemoved = 0;
+    $overlapsSplit = 0;
+    foreach (array_keys($unique) as $entry) {
+        $parts = [$entry];
+        foreach ($allowlistCidrs as $allowlistedCidr) {
+            $nextParts = [];
+            foreach ($parts as $part) {
+                array_push($nextParts, ...subtractCidr($part, $allowlistedCidr));
+            }
+            $parts = $nextParts;
+            if ($parts === []) {
+                break;
+            }
+        }
+        if ($parts === []) {
+            $overlapsRemoved++;
+            continue;
+        }
+        $canonicalInput = cidrRange($entry);
+        $inputAsCidr = intToIpv4($canonicalInput['network']) . '/' . $canonicalInput['prefix'];
+        if (count($parts) !== 1 || $parts[0] !== $inputAsCidr) {
+            $overlapsSplit++;
+        }
+        foreach ($parts as $part) {
+            $filtered[$part] = true;
+        }
+    }
+
+    $entries = array_keys($filtered);
+    usort($entries, static function (string $a, string $b): int {
+        $left = cidrRange($a);
+        $right = cidrRange($b);
+        return ($left['start'] <=> $right['start']) ?: ($left['prefix'] <=> $right['prefix']);
+    });
+
+    validateFinalEntries($entries, $allowlistCidrs);
+    return compact('entries', 'valid', 'invalid', 'ignored', 'duplicates', 'overlapsRemoved', 'overlapsSplit');
+}
+
+/** @param list<string> $entries */
+function validateFinalEntries(array $entries, array $allowlistCidrs = ALLOWLIST_CIDRS): void
+{
+    $protectedRanges = array_map('cidrRange', $allowlistCidrs);
+    foreach ($entries as $entry) {
+        if (normalizeIpv4Entry($entry) === null) {
+            throw new RuntimeException("Internal validation rejected: {$entry}");
+        }
+        $range = cidrRange($entry);
+        foreach ($protectedRanges as $protected) {
+            if ($range['start'] <= $protected['end'] && $range['end'] >= $protected['start']) {
+                throw new RuntimeException("Allowlisted network overlap remained in: {$entry}");
+            }
+        }
+    }
+}
+
+/** @return array{exitCode:int,stdout:string,stderr:string} */
+function runProcess(array $command, string $stdin = ''): array
+{
+    $spec = [
+        0 => ['pipe', 'r'],
+        1 => ['pipe', 'w'],
+        2 => ['pipe', 'w'],
+    ];
+    $process = proc_open($command, $spec, $pipes, null, null, ['bypass_shell' => true]);
+    if (!is_resource($process)) {
+        throw new RuntimeException('Unable to start process: ' . implode(' ', $command));
+    }
+
+    // A single fwrite() to a pipe may accept only part of a large restore
+    // payload. Keep writing until every byte has been delivered to ipset.
+    $offset = 0;
+    $length = strlen($stdin);
+    while ($offset < $length) {
+        $chunk = substr($stdin, $offset, min(65_536, $length - $offset));
+        $written = fwrite($pipes[0], $chunk);
+        if ($written === false || $written === 0) {
+            fclose($pipes[0]);
+            fclose($pipes[1]);
+            fclose($pipes[2]);
+            proc_terminate($process);
+            proc_close($process);
+            throw new RuntimeException('Failed to write complete input to process: ' . implode(' ', $command));
+        }
+        $offset += $written;
+    }
+    fclose($pipes[0]);
+    $stdout = stream_get_contents($pipes[1]);
+    fclose($pipes[1]);
+    $stderr = stream_get_contents($pipes[2]);
+    fclose($pipes[2]);
+    $exitCode = proc_close($process);
+    return ['exitCode' => $exitCode, 'stdout' => $stdout, 'stderr' => $stderr];
+}
+
+/** @return list<string> */
+function listIpSets(string $ipset): array
+{
+    $result = runProcess([$ipset, 'list', '-n']);
+    if ($result['exitCode'] !== 0) {
+        throw new RuntimeException('Cannot list ipsets (check CAP_NET_ADMIN/root): ' . trim($result['stderr']));
+    }
+    return array_values(array_filter(preg_split('/\R/', trim($result['stdout'])) ?: [], 'strlen'));
+}
+
+function inspectCompatibleSet(string $ipset, string $name): void
+{
+    $result = runProcess([$ipset, 'list', $name]);
+    if ($result['exitCode'] !== 0) {
+        throw new RuntimeException("Unable to inspect existing ipset {$name}: " . trim($result['stderr']));
+    }
+    if (!preg_match('/^Type:\s+hash:net\s*$/m', $result['stdout'])
+        || !preg_match('/^Header:.*\bfamily inet\b/m', $result['stdout'])) {
+        throw new RuntimeException("Existing ipset {$name} is not hash:net family inet; refusing to replace it.");
+    }
+}
+
+function destroySet(string $ipset, string $name, bool $required): bool
+{
+    $result = runProcess([$ipset, 'destroy', $name]);
+    if ($result['exitCode'] !== 0 && $required) {
+        throw new RuntimeException("Failed to destroy {$name}: " . trim($result['stderr']));
+    }
+    return $result['exitCode'] === 0;
+}
+
+/** @param list<string> $entries */
+function restoreCommands(string $setName, array $entries): string
+{
+    if (IPSET_HASHSIZE < 64 || (IPSET_HASHSIZE & (IPSET_HASHSIZE - 1)) !== 0) {
+        throw new RuntimeException('IPSET_HASHSIZE must be a power of two and at least 64.');
+    }
+    if (IPSET_MAXELEM < 1) {
+        throw new RuntimeException('IPSET_MAXELEM must be greater than zero.');
+    }
+    if (count($entries) > IPSET_MAXELEM) {
+        throw new RuntimeException(sprintf(
+            'Dataset for %s has %d entries, exceeding IPSET_MAXELEM=%d.',
+            $setName,
+            count($entries),
+            IPSET_MAXELEM
+        ));
+    }
+    $lines = [sprintf(
+        'create %s hash:net family inet hashsize %d maxelem %d',
+        $setName,
+        IPSET_HASHSIZE,
+        IPSET_MAXELEM
+    )];
+    foreach ($entries as $entry) {
+        // Values reaching here have passed strict normalization and validation.
+        $lines[] = "add {$setName} {$entry}";
+    }
+    return implode("\n", $lines) . "\n";
+}
+
+function countSavedSetEntries(string $savedSet, string $name): int
+{
+    $quotedName = preg_quote($name, '/');
+    $count = preg_match_all(
+        '/^add[ \t]+' . $quotedName . '[ \t]+\S+(?:[ \t]+[^\r\n]*)?$/m',
+        $savedSet
+    );
+    if ($count === false) {
+        throw new RuntimeException("Could not parse saved ipset {$name}.");
+    }
+    return $count;
+}
+
+function verifyTemporarySet(string $ipset, string $name, int $expectedCount): void
+{
+    // `ipset list` is intended for people and differs between ipset releases.
+    // `ipset save` has a stable command format suitable for verification.
+    $result = runProcess([$ipset, 'save', $name]);
+    if ($result['exitCode'] !== 0) {
+        throw new RuntimeException(
+            "Temporary ipset {$name} could not be read for verification: " . trim($result['stderr'])
+        );
+    }
+
+    $quotedName = preg_quote($name, '/');
+    $compatibleHeader = preg_match(
+        '/^create[ \t]+' . $quotedName . '[ \t]+hash:net\b[^\r\n]*\bfamily[ \t]+inet\b/m',
+        $result['stdout']
+    ) === 1;
+    $entryCount = countSavedSetEntries($result['stdout'], $name);
+
+    if (!$compatibleHeader || $entryCount !== $expectedCount) {
+        throw new RuntimeException(sprintf(
+            'Temporary ipset %s failed verification (compatible_header=%s, expected_entries=%d, actual_entries=%d).',
+            $name,
+            $compatibleHeader ? 'yes' : 'no',
+            $expectedCount,
+            $entryCount
+        ));
+    }
+}
+
+/**
+ * Load and swap all datasets. Active sets are untouched until every temporary
+ * set has been loaded and verified.
+ *
+ * @param array<string, list<string>> $datasets keyed by active set name
+ */
+function synchronizeIpsets(string $ipset, array $datasets, ?callable $shouldStop = null): void
+{
+    $setNames = array_keys($datasets);
+    $temporaryNames = array_map(static fn(string $name): string => $name . '_new', $setNames);
+    $existing = listIpSets($ipset);
+
+    foreach ($setNames as $name) {
+        if (in_array($name, $existing, true)) {
+            inspectCompatibleSet($ipset, $name);
+        }
+    }
+    foreach ($temporaryNames as $temporary) {
+        if (in_array($temporary, $existing, true)) {
+            logMessage("Removing stale temporary set {$temporary}.");
+            destroySet($ipset, $temporary, true);
+        }
+    }
+
+    $restore = '';
+    foreach ($setNames as $index => $name) {
+        logMessage("Preparing temporary set {$temporaryNames[$index]}.");
+        $restore .= restoreCommands($temporaryNames[$index], $datasets[$name]);
+    }
+    $restoreResult = runProcess([$ipset, 'restore'], $restore);
+    if ($restoreResult['exitCode'] !== 0) {
+        foreach ($temporaryNames as $temporary) {
+            destroySet($ipset, $temporary, false);
+        }
+        throw new RuntimeException('ipset restore failed: ' . trim($restoreResult['stderr']));
+    }
+    logMessage('ipset restore completed successfully.');
+
+    $safeToDestroyTemporarySets = true;
+    try {
+        foreach ($setNames as $index => $name) {
+            verifyTemporarySet($ipset, $temporaryNames[$index], count($datasets[$name]));
+            logMessage("Verified temporary set {$temporaryNames[$index]}.");
+        }
+
+        if ($shouldStop !== null && $shouldStop()) {
+            throw new RuntimeException('Shutdown requested before ipset swap.');
+        }
+
+        // Missing active sets are created only after both replacements are ready.
+        $createActive = '';
+        foreach ($setNames as $name) {
+            if (!in_array($name, $existing, true)) {
+                $createActive .= restoreCommands($name, []);
+            }
+        }
+        if ($createActive !== '') {
+            $createResult = runProcess([$ipset, 'restore'], $createActive);
+            if ($createResult['exitCode'] !== 0) {
+                throw new RuntimeException('Could not create missing active sets: ' . trim($createResult['stderr']));
+            }
+        }
+
+        $swapped = [];
+        $rollbackSwaps = static function (array $completedSwaps) use ($ipset, &$safeToDestroyTemporarySets): void {
+            foreach (array_reverse($completedSwaps) as [$oldTemporary, $oldActive]) {
+                $rollback = runProcess([$ipset, 'swap', $oldTemporary, $oldActive]);
+                if ($rollback['exitCode'] !== 0) {
+                    // The old active data remains under the temporary name.
+                    // Preserve it for manual recovery instead of destroying it.
+                    $safeToDestroyTemporarySets = false;
+                    logMessage("CRITICAL: rollback failed for {$oldActive}: " . trim($rollback['stderr']), true);
+                }
+            }
+        };
+        foreach ($setNames as $index => $name) {
+            if ($shouldStop !== null && $shouldStop()) {
+                $rollbackSwaps($swapped);
+                throw new RuntimeException('Shutdown requested during ipset swap; completed swaps were rolled back.');
+            }
+            $temporary = $temporaryNames[$index];
+            $swap = runProcess([$ipset, 'swap', $temporary, $name]);
+            if ($swap['exitCode'] !== 0) {
+                // Swap back in reverse order. Each temporary holds the old set.
+                $rollbackSwaps($swapped);
+                throw new RuntimeException("Swap failed for {$name}: " . trim($swap['stderr']));
+            }
+            $swapped[] = [$temporary, $name];
+            logMessage("Swap successful: {$temporary} -> {$name}.");
+            if ($shouldStop !== null && $shouldStop()) {
+                $rollbackSwaps($swapped);
+                throw new RuntimeException('Shutdown requested during ipset swap; completed swaps were rolled back.');
+            }
+        }
+    } catch (Throwable $error) {
+        if ($safeToDestroyTemporarySets) {
+            foreach ($temporaryNames as $temporary) {
+                destroySet($ipset, $temporary, false);
+            }
+        } else {
+            logMessage('CRITICAL: temporary sets were preserved because rollback was incomplete.', true);
+        }
+        throw $error;
+    }
+
+    $cleanupFailed = false;
+    foreach ($temporaryNames as $temporary) {
+        if (destroySet($ipset, $temporary, false)) {
+            logMessage("Cleanup successful: {$temporary}.");
+        } else {
+            $cleanupFailed = true;
+            logMessage("Cleanup failed: {$temporary}; active set is already updated.", true);
+        }
+    }
+    if ($cleanupFailed) {
+        throw new RuntimeException('Update completed, but one or more old temporary sets could not be destroyed.');
+    }
+}
+
+/**
+ * @param array<int, array{name:string,url:string,ipset:string}> $feeds
+ * @param callable(string,bool):array{body:string,status:int,contentType:string} $downloader
+ * @param null|callable(array<string,list<string>>):void $synchronizer
+ * @return array<string, array<string,mixed>>
+ */
+function runWorkflow(
+    array $feeds,
+    bool $insecure,
+    bool $dryRun,
+    callable $downloader,
+    ?callable $synchronizer,
+    int $minimumEntries = MINIMUM_FEED_ENTRIES,
+    ?callable $shouldStop = null
+): array
+{
+    $datasets = [];
+    $statistics = [];
+    foreach ($feeds as $feed) {
+        logMessage("Downloading {$feed['name']}.");
+        $download = $downloader($feed['url'], $insecure);
+        logMessage("Download successful for {$feed['name']} (HTTP {$download['status']}).");
+        $parsed = parseFeed($download['body']);
+
+        if ($parsed['valid'] < $minimumEntries || count($parsed['entries']) < $minimumEntries) {
+            throw new RuntimeException("{$feed['name']} contains unexpectedly few valid entries.");
+        }
+        if ($parsed['invalid'] > max(10, (int) floor($parsed['valid'] * 0.05))) {
+            throw new RuntimeException("{$feed['name']} contains an unexpectedly high number of invalid lines.");
+        }
+
+        logMessage(sprintf(
+            '%s: valid=%d invalid=%d ignored=%d duplicates=%d allowlist_removed=%d allowlist_split=%d final=%d.',
+            $feed['name'], $parsed['valid'], $parsed['invalid'], $parsed['ignored'], $parsed['duplicates'],
+            $parsed['overlapsRemoved'], $parsed['overlapsSplit'], count($parsed['entries'])
+        ));
+        $datasets[$feed['ipset']] = $parsed['entries'];
+        $statistics[$feed['name']] = $parsed;
+    }
+
+    if ($dryRun) {
+        logMessage('Dry-run complete; no ipsets were modified.');
+        return $statistics;
+    }
+    if ($shouldStop !== null && $shouldStop()) {
+        throw new RuntimeException('Shutdown requested before temporary ipsets were created.');
+    }
+    if ($synchronizer === null) {
+        throw new LogicException('No ipset synchronizer was provided.');
+    }
+    $synchronizer($datasets);
+    return $statistics;
+}
+
+/**
+ * Repeatedly execute the existing refresh workflow until SIGTERM or SIGINT.
+ * The current refresh is allowed to finish safely; no new refresh starts after
+ * a shutdown signal has been observed.
+ */
+function runDaemon(int $interval, callable $refresh): void
+{
+    $stopRequested = false;
+    $signalSupport = function_exists('pcntl_signal') && function_exists('pcntl_async_signals');
+    if ($signalSupport) {
+        pcntl_async_signals(true);
+        $handler = static function (int $signal) use (&$stopRequested): void {
+            $stopRequested = true;
+        };
+        pcntl_signal(SIGTERM, $handler);
+        pcntl_signal(SIGINT, $handler);
+    }
+
+    logMessage('daemon mode started.');
+    logMessage("refresh interval: {$interval} seconds.");
+    if (!$signalSupport) {
+        logMessage(
+            'WARNING: pcntl signal support is unavailable; graceful SIGTERM/SIGINT shutdown is disabled.',
+            true
+        );
+    }
+
+    while (!$stopRequested) {
+        $shouldStop = static function () use (&$stopRequested): bool {
+            return $stopRequested;
+        };
+        $refreshFailed = false;
+        logMessage('starting feed refresh.');
+        try {
+            $refresh($shouldStop);
+            logMessage('feed refresh successful.');
+        } catch (Throwable $error) {
+            $refreshFailed = true;
+            logMessage('feed refresh failed: ' . $error->getMessage(), true);
+            logMessage('keeping existing ipsets unchanged.', true);
+        }
+
+        if ($stopRequested) {
+            break;
+        }
+
+        logMessage($refreshFailed
+            ? "retrying in {$interval} seconds."
+            : "next refresh in {$interval} seconds.");
+        $deadline = time() + $interval;
+        while (!$stopRequested) {
+            $remaining = $deadline - time();
+            if ($remaining <= 0) {
+                break;
+            }
+            // sleep() is interrupted by SIGTERM/SIGINT; the loop rechecks the
+            // shutdown flag immediately and never busy-waits.
+            sleep($remaining);
+        }
+    }
+
+    logMessage('shutdown signal received; daemon stopped gracefully.');
+}
+
+function main(array $argv): int
+{
+    if (PHP_SAPI !== 'cli') {
+        fwrite(STDERR, "This program must run in PHP CLI mode.\n");
+        return 1;
+    }
+
+    try {
+        $options = parseOptions($argv);
+        if ($options['help']) {
+            fwrite(STDOUT, "Usage: php threatfeed-ipset.php [--dry-run] [--insecure] [--daemon [--interval=21600]]\n");
+            return 0;
+        }
+        if (!extension_loaded('curl')) {
+            throw new RuntimeException('The PHP cURL extension is required.');
+        }
+        logMessage('threatfeed-ipset started.');
+        $insecure = insecureModeEnabled($options['insecure']);
+        if ($insecure) {
+            fwrite(STDOUT, "WARNING: SSL certificate verification is disabled.\n");
+        } else {
+            logMessage('SSL certificate verification is enabled.');
+        }
+
+        $lock = fopen(LOCK_FILE, 'c');
+        if ($lock === false) {
+            throw new RuntimeException('Cannot open lock file ' . LOCK_FILE . ' (run with appropriate permissions).');
+        }
+        if (!flock($lock, LOCK_EX | LOCK_NB)) {
+            logMessage('Another instance is already running; exiting without changes.');
+            fclose($lock);
+            return 0;
+        }
+
+        $ipset = IPSET_BINARY;
+        if (!str_starts_with($ipset, '/')) {
+            throw new RuntimeException('IPSET_BINARY must be an absolute path.');
+        }
+        if (!$options['dryRun'] && (!is_file($ipset) || !is_executable($ipset))) {
+            throw new RuntimeException("The configured ipset executable was not found or is not executable: {$ipset}");
+        }
+        if ($options['dryRun'] && (!is_file($ipset) || !is_executable($ipset))) {
+            logMessage("Configured ipset executable is unavailable ({$ipset}); continuing because this is a dry-run.");
+        }
+        if (!$options['dryRun']) {
+            // Read-only command checks both executable operation and netlink permissions.
+            listIpSets($ipset);
+        }
+
+        $refresh = static function (?callable $shouldStop = null) use ($insecure, $options, $ipset): void {
+            $synchronizer = $options['dryRun']
+                ? null
+                : static fn(array $datasets) => synchronizeIpsets($ipset, $datasets, $shouldStop);
+            runWorkflow(
+                feedDefinitions(),
+                $insecure,
+                $options['dryRun'],
+                'downloadFeed',
+                $synchronizer,
+                MINIMUM_FEED_ENTRIES,
+                $shouldStop
+            );
+        };
+
+        if ($options['daemon']) {
+            runDaemon($options['interval'], $refresh);
+        } else {
+            $refresh(null);
+        }
+        flock($lock, LOCK_UN);
+        fclose($lock);
+        logMessage('threatfeed-ipset completed successfully.');
+        return 0;
+    } catch (Throwable $error) {
+        logMessage('FAILED: ' . $error->getMessage(), true);
+        return 1;
+    }
+}
+
+if (isset($_SERVER['SCRIPT_FILENAME']) && realpath($_SERVER['SCRIPT_FILENAME']) === __FILE__) {
+    exit(main($argv));
+}
