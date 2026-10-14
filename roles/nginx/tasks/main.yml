@@ -1,0 +1,10 @@
+---
+- name: Configure the Nginx base service
+  ansible.builtin.import_tasks: base.yml
+
+- name: Provision certificates required by Nginx
+  ansible.builtin.import_role:
+    name: acme
+
+- name: Configure Nginx SSL virtual hosts
+  ansible.builtin.import_tasks: ssl.yml

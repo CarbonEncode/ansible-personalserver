@@ -1,0 +1,188 @@
+---
+- name: Validate ACME configuration
+  assert:
+    that:
+      - acme_accept_terms | bool
+      - acme_email | length > 0
+      - gcore_api_key | length > 0
+      - gcore_api_key != 'CHANGE_ME'
+      - acme_wildcard_domains | length > 0
+    fail_msg: >-
+      Set acme_accept_terms, acme_email, gcore_api_key and
+      acme_wildcard_domains in the inventory before requesting certificates.
+
+- name: Ensure acme.sh dependencies are present
+  yum:
+    name:
+      - ca-certificates
+      - git
+    state: present
+
+- name: Ensure certificate reader group exists
+  group:
+    name: ssl-cert
+    state: present
+
+- name: Allow Nginx to read managed private keys
+  user:
+    name: nginx
+    groups: ssl-cert
+    append: true
+  register: acme_nginx_group_membership
+
+- name: Validate Nginx before applying certificate group membership
+  command: nginx -t
+  changed_when: false
+  when: acme_nginx_group_membership.changed
+
+- name: Restart Nginx to apply certificate group membership
+  systemd:
+    name: nginx
+    state: restarted
+  when: acme_nginx_group_membership.changed
+
+- name: Check out the pinned acme.sh release
+  git:
+    repo: https://github.com/acmesh-official/acme.sh.git
+    dest: /opt/acme.sh-source
+    version: "{{ acme_sh_version }}"
+    update: false
+
+- name: Install acme.sh and its renewal cron job
+  command:
+    argv:
+      - /opt/acme.sh-source/acme.sh
+      - --install
+      - --home
+      - /opt/acme.sh
+      - --cert-home
+      - /var/lib/acme.sh
+      - --accountemail
+      - "{{ acme_email }}"
+    creates: /opt/acme.sh/acme.sh
+
+- name: Remove the legacy acme.sh source checkout
+  file:
+    path: /usr/local/src/acme.sh
+    state: absent
+
+- name: Restrict access to the acme.sh account configuration
+  file:
+    path: /opt/acme.sh
+    state: directory
+    owner: root
+    group: root
+    mode: "0700"
+
+- name: Configure Let's Encrypt as the default ACME CA
+  command:
+    argv:
+      - /opt/acme.sh/acme.sh
+      - --home
+      - /opt/acme.sh
+      - --set-default-ca
+      - --server
+      - letsencrypt
+  changed_when: false
+
+- name: Ensure system-wide certificate directories are present
+  file:
+    path: "/etc/pki/tls/acme/{{ item }}"
+    state: directory
+    owner: root
+    group: ssl-cert
+    mode: "0750"
+  loop: "{{ acme_wildcard_domains }}"
+
+- name: Issue apex and wildcard certificates through Gcore DNS
+  command:
+    argv:
+      - /opt/acme.sh/acme.sh
+      - --home
+      - /opt/acme.sh
+      - --issue
+      - --server
+      - letsencrypt
+      - --dns
+      - dns_gcore
+      - --dnssleep
+      - "{{ acme_dns_sleep | string }}"
+      - --domain
+      - "{{ item }}"
+      - --domain
+      - "*.{{ item }}"
+      - --keylength
+      - "{{ acme_key_length | string }}"
+    creates: "/var/lib/acme.sh/{{ item }}/fullchain.cer"
+  environment:
+    GCORE_Key: "{{ gcore_api_key }}"
+  loop: "{{ acme_wildcard_domains }}"
+  loop_control:
+    label: "*.{{ item }}"
+  no_log: true
+
+- name: Check whether certificates have been installed system-wide
+  stat:
+    path: "/etc/pki/tls/acme/{{ item }}/fullchain.pem"
+  loop: "{{ acme_wildcard_domains }}"
+  loop_control:
+    label: "{{ item }}"
+  register: acme_installed_certificates
+
+- name: Check whether private keys have been installed system-wide
+  stat:
+    path: "/etc/pki/tls/acme/{{ item }}/privkey.pem"
+  loop: "{{ acme_wildcard_domains }}"
+  loop_control:
+    label: "{{ item }}"
+  register: acme_installed_private_keys
+
+- name: Pre-create certificate target files with safe permissions
+  copy:
+    content: ""
+    dest: "/etc/pki/tls/acme/{{ item.0 }}/{{ item.1.name }}"
+    owner: root
+    group: ssl-cert
+    mode: "{{ item.1.mode }}"
+    force: false
+  loop: "{{ acme_wildcard_domains | product(acme_certificate_files) | list }}"
+  loop_control:
+    label: "{{ item.0 }}/{{ item.1.name }}"
+
+- name: Install certificates into the system-wide TLS directory
+  command:
+    argv:
+      - /opt/acme.sh/acme.sh
+      - --home
+      - /opt/acme.sh
+      - --install-cert
+      - --domain
+      - "{{ item }}"
+      - --key-file
+      - "/etc/pki/tls/acme/{{ item }}/privkey.pem"
+      - --cert-file
+      - "/etc/pki/tls/acme/{{ item }}/cert.pem"
+      - --fullchain-file
+      - "/etc/pki/tls/acme/{{ item }}/fullchain.pem"
+      - --reloadcmd
+      - nginx -t && systemctl reload nginx
+  loop: "{{ acme_wildcard_domains }}"
+  loop_control:
+    label: "{{ item }}"
+    index_var: acme_domain_index
+  when: >-
+    not acme_installed_certificates.results[acme_domain_index].stat.exists
+    or (acme_installed_certificates.results[acme_domain_index].stat.size | default(0) | int == 0)
+    or not acme_installed_private_keys.results[acme_domain_index].stat.exists
+    or (acme_installed_private_keys.results[acme_domain_index].stat.size | default(0) | int == 0)
+  no_log: true
+
+- name: Set installed certificate and key permissions
+  file:
+    path: "/etc/pki/tls/acme/{{ item.0 }}/{{ item.1.name }}"
+    owner: root
+    group: ssl-cert
+    mode: "{{ item.1.mode }}"
+  loop: "{{ acme_wildcard_domains | product(acme_certificate_files) | list }}"
+  loop_control:
+    label: "{{ item.0 }}/{{ item.1.name }}"

@@ -1,0 +1,49 @@
+---
+- name: Updating the system
+  yum:
+    name: "*"
+    state: latest
+
+- name: Update hostname to "{{ system_hostname }}"
+  hostname:
+    name: "{{ system_hostname }}"
+    use: systemd
+
+- name: Set timezone to UTC
+  timezone:
+    name: UTC
+
+- name: Ensure the root SSH configuration directory exists
+  file:
+    path: /root/.ssh
+    state: directory
+    owner: root
+    group: root
+    mode: "0700"
+
+- name: Update SSH keys for root user
+  ansible.posix.authorized_key:
+    user: root
+    key: "{{ root_authorized_keys | join('\n') }}"
+    state: present
+    exclusive: true
+    manage_dir: true
+
+- name: Disable SSH password authentication
+  lineinfile:
+    dest: /etc/ssh/sshd_config
+    regexp: '^#?\s*PasswordAuthentication\s'
+    line: 'PasswordAuthentication no'
+    state: present
+  notify: Restart openssh
+
+- name: Restrict webusers to SFTP
+  blockinfile:
+    path: /etc/ssh/sshd_config
+    marker: "### {mark} ANSIBLE MANAGED BLOCK ###"
+    block: |
+      Match Group webusers
+          ForceCommand internal-sftp
+          AllowTCPForwarding no
+          X11Forwarding no
+  notify: Restart openssh

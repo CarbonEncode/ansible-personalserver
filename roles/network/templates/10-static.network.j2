@@ -1,0 +1,19 @@
+# Managed by Ansible. Local changes will be overwritten.
+[Match]
+Name={{ network_interface }}
+
+[Network]
+DHCP=no
+IPv6AcceptRA=no
+{% for address in network_ipv4.addresses %}
+Address={{ address }}
+{% endfor %}
+{% for address in network_ipv6.addresses %}
+Address={{ address }}
+{% endfor %}
+
+[Route]
+Gateway={{ network_ipv4.gateway }}
+
+[Route]
+Gateway={{ network_ipv6.gateway }}

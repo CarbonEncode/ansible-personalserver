@@ -1,0 +1,206 @@
+---
+- name: Validate the static network configuration
+  ansible.builtin.assert:
+    that:
+      - network_interface is defined
+      - network_interface | default('') | length > 0
+      - network_ipv4 is defined
+      - (network_ipv4 | default({})).addresses | default([]) | length > 0
+      - (network_ipv4 | default({})).gateway | default('') | length > 0
+      - network_ipv6 is defined
+      - (network_ipv6 | default({})).addresses | default([]) | length > 0
+      - (network_ipv6 | default({})).gateway | default('') | length > 0
+    fail_msg: >-
+      Define network_interface and non-empty addresses and gateway values for
+      both network_ipv4 and network_ipv6 in the inventory.
+
+- name: Validate the SSH firewall whitelist structure
+  ansible.builtin.assert:
+    that:
+      - firewall_ssh_whitelist is defined
+      - (firewall_ssh_whitelist | default({})).ipv4 is defined
+      - (firewall_ssh_whitelist | default({})).ipv4 is sequence
+      - (firewall_ssh_whitelist | default({})).ipv4 is not string
+      - (firewall_ssh_whitelist | default({})).ipv4 | length > 0
+      - (firewall_ssh_whitelist | default({})).ipv6 is defined
+      - (firewall_ssh_whitelist | default({})).ipv6 is sequence
+      - (firewall_ssh_whitelist | default({})).ipv6 is not string
+      - (firewall_ssh_whitelist | default({})).ipv6 | length > 0
+    fail_msg: >-
+      Define firewall_ssh_whitelist.ipv4 and firewall_ssh_whitelist.ipv6 as
+      non-empty lists of trusted IP addresses or CIDR networks.
+
+- name: Validate IPv4 SSH whitelist entries
+  ansible.builtin.command:
+    argv:
+      - "{{ ansible_facts.python.executable }}"
+      - -c
+      - >-
+        import ipaddress, sys;
+        network = ipaddress.ip_network(sys.argv[1], strict=False);
+        raise SystemExit(network.version != 4)
+      - "{{ item }}"
+  loop: "{{ firewall_ssh_whitelist.ipv4 }}"
+  loop_control:
+    label: "{{ item }}"
+  changed_when: false
+
+- name: Validate IPv6 SSH whitelist entries
+  ansible.builtin.command:
+    argv:
+      - "{{ ansible_facts.python.executable }}"
+      - -c
+      - >-
+        import ipaddress, sys;
+        network = ipaddress.ip_network(sys.argv[1], strict=False);
+        raise SystemExit(network.version != 6)
+      - "{{ item }}"
+  loop: "{{ firewall_ssh_whitelist.ipv6 }}"
+  loop_control:
+    label: "{{ item }}"
+  changed_when: false
+
+- name: Ensure systemd-networkd is installed
+  ansible.builtin.dnf:
+    name: systemd-networkd
+    state: present
+
+- name: Install the systemd-networkd static network configuration
+  ansible.builtin.template:
+    src: 10-static.network.j2
+    dest: /etc/systemd/network/10-static.network
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Restart systemd-networkd
+
+- name: Apply the systemd-networkd configuration before disabling NetworkManager
+  ansible.builtin.meta: flush_handlers
+
+- name: Ensure systemd-networkd is enabled and started
+  ansible.builtin.systemd:
+    name: systemd-networkd.service
+    enabled: true
+    state: started
+
+- name: Gather service state before disabling NetworkManager
+  ansible.builtin.service_facts:
+
+- name: Stop and disable NetworkManager services
+  ansible.builtin.systemd:
+    name: "{{ item }}"
+    enabled: false
+    state: stopped
+  loop:
+    - NetworkManager-wait-online.service
+    - NetworkManager.service
+  when: item in ansible_facts.services
+
+- name: Ensure the iptables nftables compatibility tools are present
+  yum:
+    name: iptables-nft
+    state: present
+
+- name: Ensure managed firewall directories are present
+  file:
+    path: "{{ item }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0750"
+  loop:
+    - /opt/firewall/bin
+    - /opt/firewall/etc
+
+- name: Ensure the dynamic DNS hosts file is present
+  file:
+    path: /opt/firewall/etc/ddns_hosts
+    state: touch
+    access_time: preserve
+    modification_time: preserve
+    owner: root
+    group: root
+    mode: "0640"
+
+- name: Install the managed firewall script
+  template:
+    src: iptables-rules.sh.j2
+    dest: /opt/firewall/bin/iptables-rules.sh
+    owner: root
+    group: root
+    mode: "0750"
+    validate: /bin/bash -n %s
+  notify: Restart managed firewall
+
+- name: Install the managed firewall systemd unit
+  copy:
+    src: iptables-rules.service
+    dest: /etc/systemd/system/iptables-rules.service
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Restart managed firewall
+
+- name: Refresh service state before replacing the firewall
+  service_facts:
+
+- name: Stop and disable conflicting firewall services
+  systemd:
+    name: "{{ item }}"
+    enabled: false
+    state: stopped
+  loop:
+    - firewalld.service
+    - iptables.service
+    - ip6tables.service
+  when: item in ansible_facts.services
+
+- name: Ensure conflicting firewall implementations are not present
+  yum:
+    name:
+      - firewalld
+      - iptables-services
+      - iptables-nft-services
+    state: absent
+
+- name: Ensure the managed firewall service is enabled and started
+  systemd:
+    name: iptables-rules.service
+    daemon_reload: true
+    enabled: true
+    state: started
+
+- name: Ensure systemd-resolved is enabled
+  systemd:
+    name: systemd-resolved
+    enabled: true
+    state: started
+
+- name: Configure Google Public DNS in systemd-resolved
+  blockinfile:
+    path: /etc/systemd/resolved.conf
+    marker: "# {mark} ANSIBLE MANAGED BLOCK"
+    block: |
+      [Resolve]
+      DNS=8.8.8.8#dns.google 8.8.4.4#dns.google 2001:4860:4860::8888#dns.google 2001:4860:4860::8844#dns.google
+      DNSOverTLS=yes
+  notify: Restart resolved
+
+- name: Link resolv.conf to systemd-resolved
+  file:
+    src: /run/systemd/resolve/stub-resolv.conf
+    dest: /etc/resolv.conf
+    owner: root
+    group: root
+    state: link
+    force: true
+
+- name: ensure BBR is enabled on the server
+  ini_file:
+    dest: /etc/sysctl.d/80-network.conf
+    option: "{{ item.option }}"
+    value: "{{ item.value }}"
+  with_items:
+    - { option: net.core.default_qdisc, value: "fq" }
+    - { option: net.ipv4.tcp_congestion_control, value: "bbr" }
+  notify: Reload sysctl

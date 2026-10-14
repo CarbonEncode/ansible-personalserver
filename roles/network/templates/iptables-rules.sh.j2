@@ -1,0 +1,41 @@
+#!/bin/bash
+set -euo pipefail
+
+IPT="/usr/sbin/iptables-nft"
+IP6T="/usr/sbin/ip6tables-nft"
+
+# IPv4 Rules
+
+${IPT} -F
+${IPT} -X
+${IPT} -P INPUT DROP
+${IPT} -P FORWARD DROP
+${IPT} -P OUTPUT ACCEPT
+${IPT} -A INPUT -i lo -j ACCEPT
+${IPT} -A OUTPUT -o lo -j ACCEPT
+${IPT} -A INPUT -p icmp -j ACCEPT
+${IPT} -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+{% for source in firewall_ssh_whitelist.ipv4 %}
+${IPT} -A INPUT -p tcp -s {{ source | quote }} --dport 22 -j ACCEPT
+{% endfor %}
+${IPT} -A INPUT -p tcp --dport 80 -j ACCEPT
+${IPT} -A INPUT -p tcp --dport 443 -j ACCEPT
+${IPT} -A INPUT -j DROP
+
+# IPv6 Rules
+
+${IP6T} -F
+${IP6T} -X
+${IP6T} -P INPUT DROP
+${IP6T} -P FORWARD DROP
+${IP6T} -P OUTPUT ACCEPT
+${IP6T} -A INPUT -i lo -j ACCEPT
+${IP6T} -A OUTPUT -o lo -j ACCEPT
+${IP6T} -A INPUT -p icmpv6 -j ACCEPT
+${IP6T} -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+{% for source in firewall_ssh_whitelist.ipv6 %}
+${IP6T} -A INPUT -p tcp -s {{ source | quote }} --dport 22 -j ACCEPT
+{% endfor %}
+${IP6T} -A INPUT -p tcp --dport 80 -j ACCEPT
+${IP6T} -A INPUT -p tcp --dport 443 -j ACCEPT
+${IP6T} -A INPUT -j DROP

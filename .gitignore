@@ -1,0 +1,2 @@
+# The real inventory contains host-specific configuration and secrets.
+/inventory.yml

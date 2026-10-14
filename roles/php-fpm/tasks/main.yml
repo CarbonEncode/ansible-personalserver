@@ -1,0 +1,74 @@
+---
+- name: Ensure PHP-FPM and modules are installed on the server
+  yum:
+    name: "{{ packages }}"
+    state: present
+  vars:
+    packages:
+      - php-cli
+      - php-common
+      - php-fpm
+      - php-gd
+      - php-intl
+      - php-xml
+      - php-mbstring
+      - php-mysqlnd
+      - php-pdo
+      - php-pecl-igbinary
+      - php-pecl-msgpack
+      - php-pecl-zip
+      - php-process
+      - php-opcache
+
+- name: Remove legacy global OPcache settings
+  blockinfile:
+    path: /etc/php.d/10-opcache.ini
+    marker: "; {mark} ANSIBLE MANAGED OPCACHE SETTINGS"
+    state: absent
+  notify: Restart php-fpm
+
+- name: Ensure PHP-FPM service is enabled
+  systemd:
+    name: php-fpm
+    enabled: true
+
+- name: Ensure default pool file is not present
+  file:
+    name: /etc/php-fpm.d/www.conf
+    state: absent
+
+- name: Insert managed PHP-FPM files
+  blockinfile:
+    path: /etc/php-fpm.d/{{ item | replace('.','_') }}.conf
+    marker: "; {mark} ANSIBLE MANAGED BLOCK"
+    create: true
+    block: |
+      [{{ item | replace('.','_') }}]
+      user = {{ item | replace('.','_') }}
+      group = webusers
+      listen = /run/php-fpm/php-fpm_{{ item | replace('.','_') }}.sock
+      listen.owner = nginx
+      listen.group = nginx
+      pm = dynamic
+      pm.max_children = 10
+      pm.start_servers = 5
+      pm.min_spare_servers = 5
+      pm.max_spare_servers = 10
+      chdir = /var/www/{{ item }}/public_html
+      security.limit_extensions = .php .php3 .php4 .php5 .php7
+      php_admin_value[memory_limit] = 256M
+      php_admin_value[opcache.enable] = 1
+      php_admin_value[opcache.enable_cli] = 1
+      php_admin_value[opcache.memory_consumption] = 256
+      php_admin_value[opcache.interned_strings_buffer] = 32
+      php_admin_value[opcache.max_accelerated_files] = 20000
+      php_admin_value[opcache.validate_timestamps] = 1
+      php_admin_value[opcache.revalidate_freq] = 2
+      php_admin_value[opcache.save_comments] = 1
+      php_value[session.save_handler] = files
+      php_value[session.save_path]    = /var/lib/php/session
+      php_value[soap.wsdl_cache_dir]  = /var/lib/php/wsdlcache
+      php_admin_value[disable_functions] = dl,exec,passthru,shell_exec,system,proc_open,popen,curl_exec,curl_multi_exec,show_source
+  loop:
+    "{{ sites }}"
+  notify: Restart php-fpm

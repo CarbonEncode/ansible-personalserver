@@ -1,0 +1,124 @@
+---
+- name: Ensure Nginx and TLS dependencies are present
+  yum:
+    name:
+      - nginx
+      - openssl
+    state: present
+
+- name: Ensure web content group exists
+  group:
+    name: webusers
+    state: present
+
+- name: Create Nginx web system users
+  user:
+    name: "{{ item.domain | replace('.', '_') }}"
+    shell: /usr/sbin/nologin
+    home: "/var/www/{{ item.domain }}"
+    group: webusers
+    create_home: false
+  loop: "{{ nginx_vhosts }}"
+  loop_control:
+    label: "{{ item.domain }}"
+
+- name: Add Nginx to the web content group
+  user:
+    name: nginx
+    groups: webusers
+    append: true
+
+- name: Ensure Nginx configuration directories are present
+  file:
+    path: "{{ item }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+  loop:
+    - /etc/nginx/sites-enabled
+    - /etc/nginx/sites-available
+
+- name: Ensure public_html folders exist
+  file:
+    path: "/var/www/{{ item.domain }}/public_html"
+    state: directory
+    owner: "{{ item.domain | replace('.', '_') }}"
+    group: webusers
+    mode: "0750"
+  loop: "{{ nginx_vhosts }}"
+  loop_control:
+    label: "{{ item.domain }}"
+
+- name: Ensure SELinux management support is present
+  yum:
+    name:
+      - policycoreutils-python-utils
+      - python3-libsemanage
+    state: present
+
+- name: Allow web services to read and write site content
+  community.general.sefcontext:
+    target: "/var/www/{{ item.domain | regex_escape }}/public_html(/.*)?"
+    setype: httpd_sys_rw_content_t
+    state: present
+  loop: "{{ nginx_vhosts }}"
+  loop_control:
+    label: "{{ item.domain }}"
+
+- name: Apply SELinux contexts to existing site content
+  command:
+    argv:
+      - restorecon
+      - -RF
+      - "/var/www/{{ item.domain }}/public_html"
+  changed_when: false
+  loop: "{{ nginx_vhosts }}"
+  loop_control:
+    label: "{{ item.domain }}"
+
+- name: Allow Nginx to make network connections
+  ansible.posix.seboolean:
+    name: httpd_can_network_connect
+    state: true
+    persistent: true
+
+- name: Allow Nginx to raise resource limits
+  ansible.posix.seboolean:
+    name: httpd_setrlimit
+    state: true
+    persistent: true
+
+- name: Generate Diffie-Hellman parameters for Nginx
+  command:
+    cmd: openssl dhparam -out /etc/nginx/dhparam.pem 2048
+    creates: /etc/nginx/dhparam.pem
+
+- name: Set Diffie-Hellman parameter permissions
+  file:
+    path: /etc/nginx/dhparam.pem
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: Install the primary Nginx configuration
+  template:
+    src: nginx.conf.j2
+    dest: /etc/nginx/nginx.conf
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Reload nginx
+
+- name: Validate the base Nginx configuration
+  command: nginx -t
+  changed_when: false
+
+- name: Ensure Nginx is enabled and started
+  systemd:
+    name: nginx
+    enabled: true
+    state: started
+
+- name: Apply validated base Nginx configuration changes
+  meta: flush_handlers

@@ -1,0 +1,55 @@
+---
+- name: Build the list of certificates required by SSL virtual hosts
+  set_fact:
+    nginx_required_certificates: >-
+      {{ nginx_vhosts | map(attribute='certificate') | unique | list }}
+
+- name: Check required SSL certificate files
+  stat:
+    path: "/etc/pki/tls/acme/{{ item.0 }}/{{ item.1 }}"
+  loop: "{{ nginx_required_certificates | product(['fullchain.pem', 'privkey.pem']) | list }}"
+  loop_control:
+    label: "{{ item.0 }}/{{ item.1 }}"
+  register: nginx_certificate_files
+
+- name: Require valid certificate files before deploying SSL virtual hosts
+  assert:
+    that:
+      - item.stat.exists
+      - item.stat.isreg | default(false)
+      - item.stat.size | default(0) | int > 0
+    fail_msg: >-
+      Certificate file {{ item.item.0 }}/{{ item.item.1 }} is missing or empty;
+      refusing to deploy or reload SSL virtual hosts.
+  loop: "{{ nginx_certificate_files.results }}"
+  loop_control:
+    label: "{{ item.item.0 }}/{{ item.item.1 }}"
+
+- name: Install SSL virtual hosts
+  template:
+    src: ssl-vhost.conf.j2
+    dest: "/etc/nginx/sites-available/{{ item.domain }}.conf"
+    owner: root
+    group: root
+    mode: "0644"
+  loop: "{{ nginx_vhosts }}"
+  loop_control:
+    label: "{{ item.domain }}"
+  notify: Reload nginx
+
+- name: Create sites-enabled symlinks for SSL virtual hosts
+  file:
+    src: "/etc/nginx/sites-available/{{ item.domain }}.conf"
+    dest: "/etc/nginx/sites-enabled/{{ item.domain }}.conf"
+    state: link
+  loop: "{{ nginx_vhosts }}"
+  loop_control:
+    label: "{{ item.domain }}"
+  notify: Reload nginx
+
+- name: Validate the SSL Nginx configuration
+  command: nginx -t
+  changed_when: false
+
+- name: Apply validated SSL Nginx configuration changes
+  meta: flush_handlers

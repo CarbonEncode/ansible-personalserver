@@ -1,0 +1,19 @@
+---
+- name: Ensure MariaDB is installed
+  yum:
+    name: mariadb-server
+    state: present
+
+- name: Ensure MariaDB service is enabled and started
+  systemd:
+    name: mariadb
+    enabled: true
+    state: started
+
+- name: Ensure mysql only accepts connections on localhost
+  ini_file:
+    dest: /etc/my.cnf.d/mariadb-server.cnf
+    section: mysqld
+    option: bind-address
+    value: 127.0.0.1
+  notify: Restart mariadb

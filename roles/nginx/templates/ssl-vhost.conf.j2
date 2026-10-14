@@ -1,0 +1,38 @@
+# Managed by Ansible for {{ item.domain }}. Local changes will be overwritten.
+
+# Redirect cleartext requests to HTTPS.
+server {
+    listen 80;
+    listen [::]:80;
+    server_name {{ item.domain }};
+
+    return 301 https://$host$request_uri;
+}
+
+# TLS virtual host.
+server {
+    listen 443 ssl http2;
+    listen [::]:443 ssl http2;
+    server_name {{ item.domain }};
+
+    root /var/www/{{ item.domain }}/public_html;
+    index index.php index.html;
+
+    ssl_certificate     /etc/pki/tls/acme/{{ item.certificate }}/fullchain.pem;
+    ssl_certificate_key /etc/pki/tls/acme/{{ item.certificate }}/privkey.pem;
+
+    location / {
+        try_files $uri $uri/ /index.php?$query_string;
+    }
+
+    location ~ \.php$ {
+        try_files $uri =404;
+        include fastcgi_params;
+        fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
+        fastcgi_pass unix:/run/php-fpm/php-fpm_{{ item.domain | replace('.', '_') }}.sock;
+    }
+
+    location ~ /\. {
+        deny all;
+    }
+}

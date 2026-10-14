@@ -1,0 +1,28 @@
+---
+- name: Configure the personal Fedora web server
+  hosts: all
+  remote_user: root
+  gather_facts: true
+
+  pre_tasks:
+    - name: Verify the target is running Fedora 40 or newer
+      ansible.builtin.assert:
+        that:
+          - ansible_facts.distribution == 'Fedora'
+          - ansible_facts.distribution_major_version | int >= 40
+        fail_msg: >-
+          This playbook requires Fedora 40 or newer. The target is running
+          {{ ansible_facts.distribution }}
+          {{ ansible_facts.distribution_version }}.
+        success_msg: >-
+          Target is running a supported Fedora release
+          ({{ ansible_facts.distribution_version }}).
+
+  # Roles run in dependency order. The Nginx role provisions ACME certificates
+  # after its base service is available and before enabling SSL virtual hosts.
+  roles:
+    - general
+    - network
+    - nginx
+    - mariadb
+    - php-fpm

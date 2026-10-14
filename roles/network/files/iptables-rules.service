@@ -1,0 +1,12 @@
+[Unit]
+Description=Insert managed firewall rules on start
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash /opt/firewall/bin/iptables-rules.sh
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

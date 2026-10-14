@@ -1,0 +1,72 @@
+---
+all:
+  # --------------------------------------------------------------------------
+  # Managed hosts
+  # --------------------------------------------------------------------------
+  hosts:
+    webserver:
+      ansible_host: 192.0.2.10
+  vars:
+    # ------------------------------------------------------------------------
+    # System and SSH access
+    # ------------------------------------------------------------------------
+    system_hostname: web01.example.com
+
+    # ------------------------------------------------------------------------
+    # Static dual-stack networking
+    # ------------------------------------------------------------------------
+    # Match the interface name reported by `ip link` on the target. Ensure
+    # these values are correct before applying: NetworkManager will be stopped.
+    network_interface: eth0
+    network_ipv4:
+      addresses:
+        - 192.0.2.10/24
+      gateway: 192.0.2.1
+    network_ipv6:
+      addresses:
+        - 2001:db8::10/64
+      gateway: 2001:db8::1
+
+    # Only these source addresses or networks may connect to SSH. Individual
+    # addresses and CIDR networks are accepted; keep both lists non-empty.
+    firewall_ssh_whitelist:
+      ipv4:
+        - 198.51.100.25/32
+      ipv6:
+        - 2001:db8:100::25/128
+
+    # Replace this placeholder before running the playbook. The complete list
+    # is authoritative for root because the role uses exclusive key management.
+    root_authorized_keys:
+      - "ssh-ed25519 REPLACE_WITH_PUBLIC_KEY admin@example.com"
+
+    # ------------------------------------------------------------------------
+    # ACME and certificates
+    # ------------------------------------------------------------------------
+    # Prefer encrypting the real API key with Ansible Vault.
+    gcore_api_key: "CHANGE_ME"
+    acme_email: "admin@example.com"
+    acme_accept_terms: true
+    acme_sh_version: "3.1.6"
+    acme_dns_sleep: 30
+    acme_key_length: 4096
+
+    acme_wildcard_domains:
+      - example.com
+      - apps.example.com
+
+    acme_certificate_files:
+      - { name: cert.pem, mode: "0644" }
+      - { name: fullchain.pem, mode: "0644" }
+      - { name: privkey.pem, mode: "0640" }
+
+    # ------------------------------------------------------------------------
+    # Nginx virtual hosts and PHP-FPM pools
+    # ------------------------------------------------------------------------
+    nginx_vhosts:
+      - domain: app.apps.example.com
+        certificate: apps.example.com
+      - domain: example.com
+        certificate: example.com
+
+    sites: "{{ nginx_vhosts | map(attribute='domain') | list }}"
